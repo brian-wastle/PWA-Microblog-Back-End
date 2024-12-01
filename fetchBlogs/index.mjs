@@ -3,16 +3,16 @@ import Redis from 'ioredis';
 
 // Connect to PostgreSQL
 const client = new Client({
-  user: 'your-db-user',
-  host: 'your-db-host',
-  database: 'your-db-name',
-  password: 'your-db-password',
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASSWORD,
   port: 5432,
 });
 
 // Connect to Redis (ElastiCache)
 const redis = new Redis({
-  host: process.env.CACHE_NAME,
+  host: process.env.CACHE_ENDPOINT,
   port: 6379,
 });
 
