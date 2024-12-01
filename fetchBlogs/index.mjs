@@ -12,7 +12,7 @@ const client = new Client({
 
 // Connect to Redis (ElastiCache)
 const redis = new Redis({
-  host: 'pwa-site-cache-redis-piqea1.serverless.use1.cache.amazonaws.com',
+  host: process.env.CACHE_NAME,
   port: 6379,
 });
 
