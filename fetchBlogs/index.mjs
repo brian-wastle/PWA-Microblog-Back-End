@@ -1,6 +1,6 @@
 import pkg from 'pg';
 const { Client } = pkg;
-import Redis from 'ioredis';
+import { DynamoDBClient, ScanCommand } from '@aws-sdk/client-dynamodb';
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": process.env.ALLOWED_ORIGIN || "http://localhost:4200",
@@ -16,47 +16,39 @@ const client = new Client({
   port: 5432,
 });
 
-let redis;
-
-const initializeRedis = () => {
-  if (!redis) {
-    redis = new Redis({
-      host: 'pwa-site-cache-redis-piqea1.serverless.use1.cache.amazonaws.com',
-      port: 6379,
-      connectTimeout: 10000,
-      maxRetriesPerRequest: 3,
-      tls: {},
-    });
-
-    redis.on('error', (err) => {
-      console.error('[Redis Error]', err);
-    });
-  }
-};
-initializeRedis();
+const dynamoClient = new DynamoDBClient({ region: process.env.REGION_NAME });
 
 export const handler = async (event) => {
-  const redisKey = 'recent:posts';
-  const limit = 10;
+  const limit = 10; // Number of posts in each db request
+
+  if (event.httpMethod === 'OPTIONS') {
+    return {
+        statusCode: 200,
+        headers: corsHeaders,
+        body: JSON.stringify({ message: 'CORS preflight response' })
+    };
+}
 
   try {
-    // Fetch first 10 posts from Redis
-    const cachedPosts = await redis.lrange(redisKey, 0, -1);
+    // Fetch first 10 posts from DynamoDB "cache"
+    const scanParams = {
+      TableName: process.env.TABLE_NAME,
+    };
+    const cacheData = await client.send(new ScanCommand(scanParams));
 
-    if (cachedPosts.length < limit) {
-      console.log(JSON.stringify(cachedPosts.map(JSON.parse)));
+    if (cacheData.length < limit) {
       return {
         statusCode: 200,
         headers: corsHeaders,
-        body: JSON.stringify(cachedPosts.map(JSON.parse)),
+        body: JSON.stringify(cacheData.map(JSON.parse)),
       };
     }
 
-    // Query further posts on scroll
+    // Query posts from RDS db on scroll
     const query = `SELECT * FROM posts WHERE createdAt < (SELECT createdAt FROM posts ORDER BY createdAt DESC LIMIT 1 OFFSET $1) ORDER BY createdAt DESC LIMIT $2;`;
     const res = await client.query(query, [limit, 10]);
     const posts = res.rows;
-    console.log(JSON.stringify(posts));
+
     return {
       statusCode: 200,
       headers: corsHeaders,
