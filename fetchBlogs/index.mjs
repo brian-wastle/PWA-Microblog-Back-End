@@ -27,20 +27,21 @@ export const handler = async (event) => {
         headers: corsHeaders,
         body: JSON.stringify({ message: 'CORS preflight response' })
     };
-}
+  }
 
   try {
     // Fetch first 10 posts from DynamoDB "cache"
     const scanParams = {
       TableName: process.env.TABLE_NAME,
+      Limit: limit,
     };
-    const cacheData = await client.send(new ScanCommand(scanParams));
+    const cacheData = await dynamoClient.send(new ScanCommand(scanParams));
 
-    if (cacheData.length < limit) {
+    if (cacheData.Items && cacheData.Items.length < limit) {
       return {
         statusCode: 200,
         headers: corsHeaders,
-        body: JSON.stringify(cacheData.map(JSON.parse)),
+        body: JSON.stringify(cacheData.Items),
       };
     }
 
