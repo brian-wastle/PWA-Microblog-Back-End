@@ -1,84 +1,130 @@
-import { Client } from 'pg';
+import pkg from 'pg';
+import Redis from 'ioredis';
+const { Client } = pkg;
 
-// Database client setup
-const client = new Client({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASSWORD,
-  port: 5432,
-});
+let dbClient, redis;
 
-// Lambda handler
+const corsHeaders = {
+  "Access-Control-Allow-Origin": process.env.ALLOWED_ORIGIN || "http://localhost:4200",
+  "Access-Control-Allow-Methods": "OPTIONS,POST",
+  "Access-Control-Allow-Headers": "Content-Type,Authorization",
+};
+
+const getDatabaseClient = async () => {
+  if (!dbClient) {
+    dbClient = new Client({
+      user: process.env.DB_USER,
+      host: process.env.DB_HOST,
+      database: process.env.DB_NAME,
+      password: process.env.DB_PASSWORD,
+      port: 5432,
+    });
+    await dbClient.connect();
+  }
+  return dbClient;
+};
+
+const getRedisClient = () => {
+  if (!redis) {
+    redis = new Redis({
+      host: 'pwa-site-cache-redis-piqea1.serverless.use1.cache.amazonaws.com',
+      port: 6379,
+      connectTimeout: 10000,
+      maxRetriesPerRequest: 3,
+      tls: {}
+    });
+
+    redis.on('error', (err) => {
+      console.error('[Redis Error]', err);
+    });
+  }
+  return redis;
+};
+
+const generatePost = (type, content, mediaUrls, videoUrl) => {
+  switch (type) {
+    case 'text':
+      return {
+        query: `INSERT INTO posts (id, type, content, createdAt) VALUES (gen_random_uuid(), $1, $2, NOW()) RETURNING id;`,
+        values: [type, content],
+      };
+    case 'photoAlbum':
+      return {
+        query: `INSERT INTO posts (id, type, content, mediaUrls, createdAt) VALUES (gen_random_uuid(), $1, $2, $3, NOW()) RETURNING id;`,
+        values: [type, content, JSON.stringify(mediaUrls)],
+      };
+    case 'video':
+      return {
+        query: `INSERT INTO posts (id, type, content, videoUrl, createdAt) VALUES (gen_random_uuid(), $1, $2, $3, NOW()) RETURNING id;`,
+        values: [type, content, videoUrl],
+      };
+    default:
+      throw new Error('Invalid post type');
+  }
+};
+
 export const handler = async (event) => {
-  const { type, content, mediaUrls = [], videoUrl, videoSize } = JSON.parse(event.body);
+  console.log("Received event:", JSON.stringify(event, null, 2));
 
-  if (!content || !type) {
+  //CORS
+  if (event.httpMethod === 'OPTIONS') {
     return {
-      statusCode: 400,
-      body: JSON.stringify({ error: 'Post type and content are required' }),
+      statusCode: 200,
+      headers: corsHeaders,
+      body: JSON.stringify({ message: 'CORS preflight response' }),
     };
   }
 
   try {
-    // Connect to the database
-    await client.connect();
+    const { type, content, mediaUrls = [], videoUrl } = JSON.parse(event.body || "{}");
 
-    // Handling 'text' post type
-    if (type === 'text') {
-      const query = `INSERT INTO posts (type, content, created_at) VALUES ($1, $2, NOW()) RETURNING id;`;
-      const values = [type, content];
-      await client.query(query, values);
-
+    const validTypes = ['text', 'photoAlbum', 'video'];
+    if (!type || !validTypes.includes(type) || !content) {
       return {
-        statusCode: 200,
-        body: JSON.stringify({ message: 'Text post created successfully' }),
+        statusCode: 400,
+        headers: corsHeaders,
+        body: JSON.stringify({ error: 'Invalid input' }),
       };
     }
 
-    // Handling 'photoAlbum' post type
-    if (type === 'photoAlbum') {
-      if (mediaUrls.length === 0) {
-        return { statusCode: 400, body: JSON.stringify({ error: 'At least one photo URL is required' }) };
-      }
+    const dbClient = await getDatabaseClient();
+    const redis = getRedisClient();
 
-      // Save photo album posts
-      const query = `INSERT INTO posts (type, content, media_urls, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id;`;
-      const values = [type, content, JSON.stringify(mediaUrls)];
-      await client.query(query, values);
+    const { query, values } = generatePost(type, content, mediaUrls, videoUrl);
 
-      return {
-        statusCode: 200,
-        body: JSON.stringify({ message: 'Photo album post created successfully' }),
-      };
+    // Insert post to DB
+    const result = await dbClient.query(query, values);
+    const postId = result.rows[0]?.id;
+
+    if (!postId) {
+      throw new Error('Failed to create post');
     }
 
-    // Handling 'video' post type
-    if (type === 'video') {
-      if (!videoUrl || !videoSize) {
-        return { statusCode: 400, body: JSON.stringify({ error: 'Video URL and video size are required for video posts' }) };
-      }
+    // Confirm insertion
+    const fetchPostQuery = 'SELECT * FROM posts WHERE id = $1';
+    const postResult = await dbClient.query(fetchPostQuery, [postId]);
+    const newPost = postResult.rows[0];
 
-      // Save video post
-      const query = `INSERT INTO posts (type, content, video_url, created_at) VALUES ($1, $2, $3, NOW()) RETURNING id;`;
-      const values = [type, content, videoUrl];
-      await client.query(query, values);
-
-      return {
-        statusCode: 200,
-        body: JSON.stringify({ message: 'Video post created successfully' }),
-      };
+    if (!newPost) {
+      throw new Error('Failed to retrieve newly created post');
     }
+
+    // Update cache
+    const redisKey = 'recent:posts';
+    await redis.lpush(redisKey, JSON.stringify(newPost));
+    await redis.ltrim(redisKey, 0, 9);
 
     return {
-      statusCode: 400,
-      body: JSON.stringify({ error: 'Invalid post type' }),
+      statusCode: 200,
+      headers: corsHeaders,
+      body: JSON.stringify({ message: 'Post created successfully', postId }),
     };
   } catch (error) {
-    console.error('Error creating post:', error);
-    return { statusCode: 500, body: JSON.stringify({ error: 'Error creating post' }) };
-  } finally {
-    // Ensure the DB connection is closed after each request
-    await client.end();
+    console.error('Error creating post:', error.message, error.stack);
+    return {
+      statusCode: 500,
+      headers: corsHeaders,
+      body: JSON.stringify({ error: 'Internal Server Error' }),
+    };
   }
 };

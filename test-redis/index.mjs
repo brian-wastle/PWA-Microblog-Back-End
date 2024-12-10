@@ -33,7 +33,7 @@ import https from 'https';
 import dns from 'dns';
 
 export const handler2 = async (event) => {
-  const hostname = 'pwa-site-cache-redis-piqea1.serverless.use1.cache.amazonaws.com';
+  const hostname = process.env.CACHE_ENDPOINT;
   const port = 6379;
 
   return new Promise((resolve) => {

@@ -1,10 +1,13 @@
-import dns from 'dns/promises';
-
 import pkg from 'pg';
 const { Client } = pkg;
 import Redis from 'ioredis';
 
-// Connect to PostgreSQL
+const corsHeaders = {
+  "Access-Control-Allow-Origin": process.env.ALLOWED_ORIGIN || "http://localhost:4200",
+  "Access-Control-Allow-Methods": "OPTIONS,GET",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
 const client = new Client({
   user: process.env.DB_USER,
   host: process.env.DB_HOST,
@@ -13,56 +16,47 @@ const client = new Client({
   port: 5432,
 });
 
-// Connect to Redis (ElastiCache)
+let redis;
 
+const initializeRedis = () => {
+  if (!redis) {
+    redis = new Redis({
+      host: 'pwa-site-cache-redis-piqea1.serverless.use1.cache.amazonaws.com',
+      port: 6379,
+      connectTimeout: 10000,
+      maxRetriesPerRequest: 3,
+      tls: {},
+    });
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": process.env.ALLOWED_ORIGIN || "http://localhost:4200",
-  "Access-Control-Allow-Methods": "OPTIONS,GET",
-  "Access-Control-Allow-Headers": "Content-Type",
+    redis.on('error', (err) => {
+      console.error('[Redis Error]', err);
+    });
+  }
 };
+initializeRedis();
 
 export const handler = async (event) => {
-  const redis = new Redis({
-    host: process.env.CACHE_ENDPOINT,
-    port: 6379,
-    connectTimeout: 10000, // 10 seconds
-    maxRetriesPerRequest: 3, // Reduce retries
-    tls: {},
-  });
-
-  const { page = 1, limit = 10 } = event.queryStringParameters;
-  const offset = (page - 1) * limit;
-
+  const redisKey = 'recent:posts';
+  const limit = 10;
 
   try {
-    const cacheKey = `posts:page:${page}:limit:${limit}`;
-    const cachedPosts = await redis.get(cacheKey);
+    // Fetch first 10 posts from Redis
+    const cachedPosts = await redis.lrange(redisKey, 0, -1);
 
-    if (cachedPosts) {
-      console.log('Cache hit');
+    if (cachedPosts.length < limit) {
+      console.log(JSON.stringify(cachedPosts.map(JSON.parse)));
       return {
         statusCode: 200,
         headers: corsHeaders,
-        body: cachedPosts,
+        body: JSON.stringify(cachedPosts.map(JSON.parse)),
       };
     }
 
-    console.log('Cache miss, querying database');
-    await client.connect();
-
-    const query = `
-      SELECT * FROM posts 
-      ORDER BY createdAt DESC
-      LIMIT $1 OFFSET $2;
-    `;
-    const values = [limit, offset];
-    const res = await client.query(query, values);
-
+    // Query further posts on scroll
+    const query = `SELECT * FROM posts WHERE createdAt < (SELECT createdAt FROM posts ORDER BY createdAt DESC LIMIT 1 OFFSET $1) ORDER BY createdAt DESC LIMIT $2;`;
+    const res = await client.query(query, [limit, 10]);
     const posts = res.rows;
-
-    await redis.set(cacheKey, JSON.stringify(posts), 'EX', 3600);
-
+    console.log(JSON.stringify(posts));
     return {
       statusCode: 200,
       headers: corsHeaders,
@@ -75,7 +69,5 @@ export const handler = async (event) => {
       headers: corsHeaders,
       body: JSON.stringify({ error: 'Error fetching posts' }),
     };
-  } finally {
-    await client.end();
   }
 };
