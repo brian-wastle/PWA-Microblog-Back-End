@@ -8,6 +8,7 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
+// PostgreSQL client
 const client = new Client({
   user: process.env.DB_USER,
   host: process.env.DB_HOST,
@@ -16,40 +17,66 @@ const client = new Client({
   port: 5432,
 });
 
-const dynamoClient = new DynamoDBClient({ region: process.env.REGION_NAME });
+// DynamoDB client
+const dynamoClient = new DynamoDBClient({ region: process.env.REGION_NAME, endpoint: process.env.CACHE_ENDPOINT });
 
 export const handler = async (event) => {
-  const limit = 10; // Number of posts in each db request
+  const limit = 10;
 
   if (event.httpMethod === 'OPTIONS') {
     return {
-        statusCode: 200,
-        headers: corsHeaders,
-        body: JSON.stringify({ message: 'CORS preflight response' })
+      statusCode: 200,
+      headers: corsHeaders,
+      body: JSON.stringify({ message: 'CORS preflight response' }),
     };
   }
 
   try {
-    // Fetch first 10 posts from DynamoDB "cache"
-    const scanParams = {
-      TableName: process.env.TABLE_NAME,
-      Limit: limit,
-    };
-    const cacheData = await dynamoClient.send(new ScanCommand(scanParams));
+    const queryParams = event.queryStringParameters || {};
+    const lastCreatedAt = queryParams.lastcreatedat; // Adjusted to lowercase
 
-    if (cacheData.Items && cacheData.Items.length < limit) {
+    // Fetch from DynamoDB cache if lastCreatedAt is not provided
+    if (!lastCreatedAt) {
+      const scanParams = {
+        TableName: process.env.TABLE_NAME,
+        Limit: limit,
+      };
+      const cacheData = await dynamoClient.send(new ScanCommand(scanParams));
+
+      // Map DynamoDB items to a consistent structure
+      const posts = (cacheData.Items || []).map((item) => ({
+        id: item.id.S,
+        type: item.type.S,
+        content: item.content.S,
+        createdAt: item.createdAt.S,
+        mediaUrls: item.mediaUrls?.L?.map((url) => url.S) || [],
+        videoUrl: item.videoUrl?.S || null,
+      }));
+
       return {
         statusCode: 200,
         headers: corsHeaders,
-        body: JSON.stringify(cacheData.Items),
+        body: JSON.stringify(posts),
       };
     }
 
-    // Query posts from RDS db on scroll
-    const query = `SELECT * FROM posts WHERE createdAt < (SELECT createdAt FROM posts ORDER BY createdAt DESC LIMIT 1 OFFSET $1) ORDER BY createdAt DESC LIMIT $2;`;
-    const res = await client.query(query, [limit, 10]);
-    const posts = res.rows;
-
+    // Fetch older posts from PostgreSQL
+    const query = `
+      SELECT id, type, content, createdat, mediaurls, videourl
+      FROM posts
+      WHERE createdat < $1
+      ORDER BY createdat DESC
+      LIMIT $2;
+    `;
+    const res = await client.query(query, [lastCreatedAt, limit]);
+    const posts = res.rows.map((row) => ({
+      id: row.id,
+      type: row.type,
+      content: row.content,
+      createdAt: row.createdat,
+      mediaUrls: row.mediaurls || [],
+      videoUrl: row.videourl || null,
+    }));
     return {
       statusCode: 200,
       headers: corsHeaders,

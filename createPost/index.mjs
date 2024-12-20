@@ -10,7 +10,7 @@ const corsHeaders = {
 };
 
 // DynamoDB client
-const dynamoClient = new DynamoDBClient({ region: process.env.REGION_NAME });
+const dynamoClient = new DynamoDBClient({ region: process.env.REGION_NAME, endpoint: process.env.CACHE_ENDPOINT });
 
 // PostgreSQL client
 let dbClient;
@@ -57,25 +57,29 @@ const updateRecentPosts = async (newPost) => {
     const dynamoItem = {
       id: { S: newPost.id },
       type: { S: newPost.type },
-      createdAt: { N: newPost.createdAt.toString() },
-      content: { S: newPost.content || "" },
+      content: { S: newPost.content },
+      createdAt: { S: newPost.createdat },
     };
 
-    if (newPost.type === "photoAlbum" && newPost.mediaUrls) {
-      dynamoItem.mediaUrls = { S: JSON.stringify(newPost.mediaUrls) };
+    // Handle mediaUrls and videoUrl based on type
+    if (newPost.type === "photoAlbum") {
+      dynamoItem.mediaUrls = { L: (newPost.mediaurls).map((url) => ({ S: url })) };
     }
-
-    if (newPost.type === "video" && newPost.videoUrl) {
-      dynamoItem.videoUrl = { S: newPost.videoUrl };
+    if (newPost.type === "video") {
+      dynamoItem.videoUrl = { S: newPost.videourl };
     }
 
     const putParams = {
       TableName: process.env.TABLE_NAME,
       Item: dynamoItem,
     };
-    await dynamoClient.send(new PutItemCommand(putParams));
 
-    // Verify cache
+    console.log("DynamoDB item to insert:", JSON.stringify(dynamoItem));
+    
+    await dynamoClient.send(new PutItemCommand(putParams));
+    console.log("PutItem success");
+
+    // Get cache and trim to 10 posts
     const scanParams = {
       TableName: process.env.TABLE_NAME,
       ProjectionExpression: "id, createdAt",
@@ -84,14 +88,13 @@ const updateRecentPosts = async (newPost) => {
 
     const items = (scanResult.Items || []).map((item) => ({
       id: item.id.S,
-      createdAt: Number(item.createdAt.N),
+      createdAt: new Date(item.createdAt.S).getTime(),
     }));
     items.sort((a, b) => b.createdAt - a.createdAt);
-
-    // Trim cache to 10 posts
+    
     if (items.length > 10) {
-      const itemsToDelete = items.slice(10);
-      for (const item of itemsToDelete) {
+      const cacheOverflow = items.slice(10);
+      for (const item of cacheOverflow) {
         const deleteParams = {
           TableName: process.env.TABLE_NAME,
           Key: {
@@ -105,9 +108,9 @@ const updateRecentPosts = async (newPost) => {
     console.log("Recent posts updated successfully");
   } catch (error) {
     console.error("Error updating recent posts:", error);
+    throw error;
   }
 };
-
 
 export const handler = async (event) => {
   console.log("Received event:", JSON.stringify(event, null, 2));
@@ -148,7 +151,11 @@ export const handler = async (event) => {
     }
 
     // Retrieve the newly created post
-    const fetchPostQuery = "SELECT * FROM posts WHERE id = $1";
+    const fetchPostQuery = `
+      SELECT id, type, content, createdat, mediaurls, videourl
+      FROM posts
+      WHERE id = $1
+    `;
     const postResult = await dbClient.query(fetchPostQuery, [postId]);
     const newPost = postResult.rows[0];
 
@@ -156,6 +163,7 @@ export const handler = async (event) => {
       throw new Error("Failed to retrieve newly created post");
     }
 
+    console.log("Newly created post:", newPost);
     // Update DynamoDB cache
     await updateRecentPosts(newPost);
 
