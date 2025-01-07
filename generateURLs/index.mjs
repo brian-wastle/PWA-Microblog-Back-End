@@ -67,7 +67,7 @@ const generatePresignedUrls = async (fileNames) => {
             Bucket: 'streaming-video-pwa',
             Key: key,
             Expires: 60 * 15,  // Presigned URL expiration time (5 minutes)
-            ContentType: 'image/png',
+            ContentType: 'image/jpg',
         };
 
         const signedUrl = await s3.getSignedUrlPromise('putObject', params);

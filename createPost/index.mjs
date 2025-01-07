@@ -1,10 +1,11 @@
 import pkg from 'pg';
 const { Client } = pkg;
 import { DynamoDBClient, PutItemCommand, ScanCommand, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
+import sharp from 'sharp';
 
-// CORS
+
 const corsHeaders = {
-  "Access-Control-Allow-Origin": process.env.ALLOWED_ORIGIN || "http://localhost:4200",
+  "Access-Control-Allow-Origin": "http://localhost:4200",
   "Access-Control-Allow-Methods": "OPTIONS,POST",
   "Access-Control-Allow-Headers": "Content-Type,Authorization",
 };
@@ -14,6 +15,53 @@ const dynamoClient = new DynamoDBClient({ region: process.env.REGION_NAME, endpo
 
 // PostgreSQL client
 let dbClient;
+
+export const handler = async (event) => {
+  console.log("Received event:", JSON.stringify(event, null, 2));
+
+  if (event.httpMethod === "OPTIONS") {
+    return createResponse(200, { message: "CORS preflight response" });
+  }
+
+  try {
+    const { type, content, mediaUrls = [], videoUrl } = JSON.parse(event.body || "{}");
+
+    // Verify types
+    const validTypes = ["text", "photoAlbum", "video"];
+    if (!type || !validTypes.includes(type) || !content) {
+      return createResponse(400, { error: "Invalid input" });
+    }
+
+    await getDatabaseClient();
+
+    // Optimize images if the type is "photoAlbum"
+    let optimizedMediaUrls = mediaUrls;
+    if (type === "photoAlbum" && mediaUrls.length > 0) {
+      const bucket = process.env.S3_BUCKET_NAME;
+      optimizedMediaUrls = await Promise.all(
+        mediaUrls.map((key) => optimizeImage(bucket, key))
+      );
+      console.log("Optimized media URLs:", optimizedMediaUrls);
+    }
+
+    const { query, values } = generatePost(type, content, optimizedMediaUrls, videoUrl);
+    const postId = await createPost(query, values);
+
+    // Retrieve the post to validate creation
+    const newPost = await validatePost(postId);
+
+    console.log("Newly created post:", newPost);
+
+    // Update DynamoDB cache
+    await updateRecentPosts(newPost);
+
+    return createResponse(200, { message: "Post Created Successfully", postId });
+  } catch (error) {
+    console.error("Error creating post:", error.message, error.stack);
+    return createResponse(500, { message: "Internal Server Error" });
+  }
+};
+
 const getDatabaseClient = async () => {
   if (!dbClient) {
     dbClient = new Client({
@@ -75,7 +123,7 @@ const updateRecentPosts = async (newPost) => {
     };
 
     console.log("DynamoDB item to insert:", JSON.stringify(dynamoItem));
-    
+
     await dynamoClient.send(new PutItemCommand(putParams));
     console.log("PutItem success");
 
@@ -91,7 +139,7 @@ const updateRecentPosts = async (newPost) => {
       createdAt: new Date(item.createdAt.S).getTime(),
     }));
     items.sort((a, b) => b.createdAt - a.createdAt);
-    
+
     if (items.length > 10) {
       const cacheOverflow = items.slice(10);
       for (const item of cacheOverflow) {
@@ -112,72 +160,56 @@ const updateRecentPosts = async (newPost) => {
   }
 };
 
-export const handler = async (event) => {
-  console.log("Received event:", JSON.stringify(event, null, 2));
+const optimizeImage = async (bucket, key) => {
+  // Validate S3 upload
+  const imageData = await s3.getObject({ Bucket: bucket, Key: key }).promise();
 
-  // CORS
-  if (event.httpMethod === "OPTIONS") {
-    return {
-      statusCode: 200,
-      headers: corsHeaders,
-      body: JSON.stringify({ message: "CORS preflight response" }),
-    };
+  // Optimize the image using Sharp
+  const optimizedData = await sharp(imageData.Body)
+    .resize({ width: 1500 }) // Resize to 1500px width
+    .jpeg({ quality: 80 }) // Compress to 80% quality
+    .toBuffer();
+
+  // Overwrite the original upload
+  await s3
+    .putObject({
+      Bucket: bucket,
+      Key: key,
+      Body: optimizedData,
+      ContentType: 'image/jpeg',
+    })
+    .promise();
+
+  return key;
+};
+
+const createResponse = (statusCode, body) => ({
+  statusCode,
+  headers: corsHeaders,
+  body: JSON.stringify(body),
+});
+
+
+
+const createPost = async (query, values) => {
+  const result = await dbClient.query(query, values);
+  const postId = result.rows[0]?.id;
+  if (!postId) {
+    throw new Error("Failed to create post");
   }
+  return postId;
+}
 
-  try {
-    const { type, content, mediaUrls = [], videoUrl } = JSON.parse(event.body || "{}");
-
-    // Verify types
-    const validTypes = ["text", "photoAlbum", "video"];
-    if (!type || !validTypes.includes(type) || !content) {
-      return {
-        statusCode: 400,
-        headers: corsHeaders,
-        body: JSON.stringify({ error: "Invalid input" }),
-      };
-    }
-
-    const dbClient = await getDatabaseClient();
-
-    // Generate SQL query
-    const { query, values } = generatePost(type, content, mediaUrls, videoUrl);
-
-    // Insert post to database
-    const result = await dbClient.query(query, values);
-    const postId = result.rows[0]?.id;
-
-    if (!postId) {
-      throw new Error("Failed to create post");
-    }
-
-    // Retrieve the newly created post
-    const fetchPostQuery = `
+const validatePost = async (postId) => {
+  const fetchPostQuery = `
       SELECT id, type, content, createdat, mediaurls, videourl
       FROM posts
       WHERE id = $1
     `;
-    const postResult = await dbClient.query(fetchPostQuery, [postId]);
-    const newPost = postResult.rows[0];
-
-    if (!newPost) {
-      throw new Error("Failed to retrieve newly created post");
-    }
-
-    console.log("Newly created post:", newPost);
-    // Update DynamoDB cache
-    await updateRecentPosts(newPost);
-
-    return {
-      statusCode: 200,
-      headers: corsHeaders,
-      body: JSON.stringify({ message: "Post created successfully", postId }),
-    };
-  } catch (error) {
-    console.error("Error creating post:", error.message, error.stack);
-    return {
-      statusCode: 500,
-      headers: corsHeaders,
-      body: JSON.stringify({ error: "Internal Server Error" }),
-    };
+  const postResult = await dbClient.query(fetchPostQuery, [postId]);
+  const newPost = postResult.rows[0];
+  if (!newPost) {
+    throw new Error("Failed to retrieve newly created post");
   }
-};
+  return newPost;
+}

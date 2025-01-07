@@ -33,7 +33,7 @@ export const handler = async (event) => {
 
   try {
     const queryParams = event.queryStringParameters || {};
-    const lastCreatedAt = queryParams.lastcreatedat; // Adjusted to lowercase
+    const lastCreatedAt = queryParams.lastcreatedAt;
 
     // Fetch from DynamoDB cache if lastCreatedAt is not provided
     if (!lastCreatedAt) {
