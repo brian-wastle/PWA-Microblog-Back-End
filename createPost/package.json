@@ -4,13 +4,14 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dockerbuild": "docker run --entrypoint /bin/bash -v \"C:/Users/brian/Web Development/pwa-site-backend/createPost:/var/task\" public.ecr.aws/lambda/nodejs:22 -c \"npm install\""
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.709.0",
+    "@aws-sdk/client-s3": "^3.723.0",
     "pg": "^8.13.1",
     "sharp": "^0.33.5"
   }

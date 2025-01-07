@@ -1,6 +1,7 @@
 import pkg from 'pg';
 const { Client } = pkg;
 import { DynamoDBClient, PutItemCommand, ScanCommand, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
+import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import sharp from 'sharp';
 
 
@@ -9,6 +10,8 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "OPTIONS,POST",
   "Access-Control-Allow-Headers": "Content-Type,Authorization",
 };
+
+const s3 = new S3Client({ region: process.env.REGION_NAME });
 
 // DynamoDB client
 const dynamoClient = new DynamoDBClient({ region: process.env.REGION_NAME, endpoint: process.env.CACHE_ENDPOINT });
@@ -39,8 +42,13 @@ export const handler = async (event) => {
     if (type === "photoAlbum" && mediaUrls.length > 0) {
       const bucket = process.env.S3_BUCKET_NAME;
       optimizedMediaUrls = await Promise.all(
-        mediaUrls.map((key) => optimizeImage(bucket, key))
+        mediaUrls.map(async (key) => {
+          const optimizedKey = await optimizeImage(bucket, key);
+          // Return full URL
+          return `https://${bucket}.s3.amazonaws.com/${optimizedKey}`;
+        })
       );
+
       console.log("Optimized media URLs:", optimizedMediaUrls);
     }
 
@@ -161,35 +169,55 @@ const updateRecentPosts = async (newPost) => {
 };
 
 const optimizeImage = async (bucket, key) => {
-  // Validate S3 upload
-  const imageData = await s3.getObject({ Bucket: bucket, Key: key }).promise();
+  try {
+    // Ensure the key is extracted from the full URL if necessary
+    if (key.startsWith("http")) {
+      const urlObj = new URL(key);
+      key = decodeURIComponent(urlObj.pathname.substring(1)); // Extract the key from the URL
+    }
+    console.log(`[${Date.now()}] Retrieving image from S3: Bucket=${bucket}, Key=${key}`);
 
-  // Optimize the image using Sharp
-  const optimizedData = await sharp(imageData.Body)
-    .resize({ width: 1500 }) // Resize to 1500px width
-    .jpeg({ quality: 80 }) // Compress to 80% quality
-    .toBuffer();
+    // Retrieve the image object
+    const getObjectParams = { Bucket: bucket, Key: key };
+    console.log(`[${Date.now()}] Bucket: ${bucket}, Key: ${key}`);
+    const imageData = await s3.send(new GetObjectCommand(getObjectParams));
+    console.log(`[${Date.now()}] S3 GetObject response:`, imageData);
 
-  // Overwrite the original upload
-  await s3
-    .putObject({
+    const imageBody = await streamToBuffer(imageData.Body);
+    console.log(`[${Date.now()}] Image converted to buffer`);
+
+    // Optimize the image using Sharp
+    const optimizedData = await sharp(imageBody)
+      .resize({ width: 1500 }) // Resize to 1500px width
+      .png({ quality: 80 }) // Compress to 80% quality
+      .toBuffer();
+    console.log(`[${Date.now()}] Image optimized with sharp`);
+
+    // Overwrite the original upload
+    const putObjectParams = {
       Bucket: bucket,
       Key: key,
       Body: optimizedData,
-      ContentType: 'image/jpeg',
-    })
-    .promise();
+      ContentType: 'image/png',
+    };
+    await s3.send(new PutObjectCommand(putObjectParams));
+    console.log(`[${Date.now()}] Optimized image uploaded back to S3`);
 
-  return key;
+    return key;
+  } catch (error) {
+    console.error(`[${Date.now()}] Error optimizing image:`, error);
+    throw error;
+  }
 };
 
-const createResponse = (statusCode, body) => ({
-  statusCode,
-  headers: corsHeaders,
-  body: JSON.stringify(body),
-});
-
-
+const streamToBuffer = async (stream) => {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+    stream.on("error", (err) => reject(err));
+  });
+};
 
 const createPost = async (query, values) => {
   const result = await dbClient.query(query, values);
@@ -213,3 +241,9 @@ const validatePost = async (postId) => {
   }
   return newPost;
 }
+
+const createResponse = (statusCode, body) => ({
+  statusCode,
+  headers: corsHeaders,
+  body: JSON.stringify(body),
+});
