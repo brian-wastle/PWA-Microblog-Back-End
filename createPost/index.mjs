@@ -140,23 +140,34 @@ const updateRecentPosts = async (newPost) => {
       TableName: process.env.TABLE_NAME,
       ProjectionExpression: "id, createdAt",
     };
+
     const scanResult = await dynamoClient.send(new ScanCommand(scanParams));
+    console.log("Scan Result:", JSON.stringify(scanResult, null, 2));
 
     const items = (scanResult.Items || []).map((item) => ({
-      id: item.id.S,
-      createdAt: new Date(item.createdAt.S).getTime(),
+      id: item.id?.S,
+      createdAt: item.createdAt?.S,
     }));
-    items.sort((a, b) => b.createdAt - a.createdAt);
+
+    // Sort items using ISO strings
+    items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
     if (items.length > 10) {
       const cacheOverflow = items.slice(10);
+
+      cacheOverflow.forEach((element, index) => {
+        console.log(`Element ${index}: ${JSON.stringify(element, null, 2)}`);
+      });
+
       for (const item of cacheOverflow) {
         const deleteParams = {
           TableName: process.env.TABLE_NAME,
           Key: {
-            id: { S: item.id },
+              id: { S: item.id },
+              createdAt: { S: item.createdAt },
           },
-        };
+      };
+        console.log("Deleting item:", JSON.stringify(deleteParams));
         await dynamoClient.send(new DeleteItemCommand(deleteParams));
       }
     }
