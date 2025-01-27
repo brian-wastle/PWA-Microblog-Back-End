@@ -14,7 +14,7 @@ const corsHeaders = {
 const s3 = new S3Client({ region: process.env.REGION_NAME });
 
 // DynamoDB client
-const dynamoClient = new DynamoDBClient({ region: process.env.REGION_NAME, endpoint: process.env.CACHE_ENDPOINT });
+const dynamoClient = new DynamoDBClient({ region: process.env.REGION_NAME});
 
 // PostgreSQL client
 let dbClient;
@@ -89,17 +89,20 @@ const generatePost = (type, content, mediaUrls, videoUrl) => {
   switch (type) {
     case "text":
       return {
-        query: `INSERT INTO posts (id, type, content, createdAt) VALUES (gen_random_uuid(), $1, $2, NOW()) RETURNING id;`,
+        query: `INSERT INTO posts (id, type, content, createdAt) 
+                VALUES (gen_random_uuid(), $1, $2, NOW()) RETURNING id, createdAt;`,
         values: [type, content],
       };
     case "photoAlbum":
       return {
-        query: `INSERT INTO posts (id, type, content, mediaUrls, createdAt) VALUES (gen_random_uuid(), $1, $2, $3, NOW()) RETURNING id;`,
+        query: `INSERT INTO posts (id, type, content, mediaUrls, createdAt) 
+                VALUES (gen_random_uuid(), $1, $2, $3, NOW()) RETURNING id, createdAt;`,
         values: [type, content, JSON.stringify(mediaUrls)],
       };
     case "video":
       return {
-        query: `INSERT INTO posts (id, type, content, videoUrl, createdAt) VALUES (gen_random_uuid(), $1, $2, $3, NOW()) RETURNING id;`,
+        query: `INSERT INTO posts (id, type, content, videoUrl, createdAt) 
+                VALUES (gen_random_uuid(), $1, $2, $3, NOW()) RETURNING id, createdAt;`,
         values: [type, content, videoUrl],
       };
     default:
@@ -107,14 +110,15 @@ const generatePost = (type, content, mediaUrls, videoUrl) => {
   }
 };
 
-// Use DynamoDB to manage "cache" on new post
 const updateRecentPosts = async (newPost) => {
   try {
+    const formattedCreatedAt = new Date(newPost.createdat).toISOString();
+
     const dynamoItem = {
       id: { S: newPost.id },
       type: { S: newPost.type },
       content: { S: newPost.content },
-      createdAt: { S: newPost.createdat },
+      createdAt: { S: formattedCreatedAt },
     };
 
     // Handle mediaUrls and videoUrl based on type
@@ -129,44 +133,33 @@ const updateRecentPosts = async (newPost) => {
       TableName: process.env.TABLE_NAME,
       Item: dynamoItem,
     };
-
-    console.log("DynamoDB item to insert:", JSON.stringify(dynamoItem));
-
     await dynamoClient.send(new PutItemCommand(putParams));
     console.log("PutItem success");
 
-    // Get cache and trim to 10 posts
+    // Verify cache
     const scanParams = {
       TableName: process.env.TABLE_NAME,
       ProjectionExpression: "id, createdAt",
     };
-
     const scanResult = await dynamoClient.send(new ScanCommand(scanParams));
     console.log("Scan Result:", JSON.stringify(scanResult, null, 2));
 
+    // Clean-up cache
     const items = (scanResult.Items || []).map((item) => ({
       id: item.id?.S,
       createdAt: item.createdAt?.S,
     }));
-
-    // Sort items using ISO strings
     items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-
     if (items.length > 10) {
       const cacheOverflow = items.slice(10);
-
-      cacheOverflow.forEach((element, index) => {
-        console.log(`Element ${index}: ${JSON.stringify(element, null, 2)}`);
-      });
-
       for (const item of cacheOverflow) {
         const deleteParams = {
           TableName: process.env.TABLE_NAME,
           Key: {
-              id: { S: item.id },
-              createdAt: { S: item.createdAt },
+            id: { S: item.id },
+            createdAt: { S: item.createdAt },
           },
-      };
+        };
         console.log("Deleting item:", JSON.stringify(deleteParams));
         await dynamoClient.send(new DeleteItemCommand(deleteParams));
       }
@@ -181,28 +174,23 @@ const updateRecentPosts = async (newPost) => {
 
 const optimizeImage = async (bucket, key) => {
   try {
-    // Ensure the key is extracted from the full URL if necessary
     if (key.startsWith("http")) {
       const urlObj = new URL(key);
-      key = decodeURIComponent(urlObj.pathname.substring(1)); // Extract the key from the URL
+      key = decodeURIComponent(urlObj.pathname.substring(1));
     }
-    console.log(`[${Date.now()}] Retrieving image from S3: Bucket=${bucket}, Key=${key}`);
+    console.log(`Retrieving image from S3: Bucket=${bucket}, Key=${key}`);
 
-    // Retrieve the image object
+    // Retrieve stored image
     const getObjectParams = { Bucket: bucket, Key: key };
-    console.log(`[${Date.now()}] Bucket: ${bucket}, Key: ${key}`);
     const imageData = await s3.send(new GetObjectCommand(getObjectParams));
-    console.log(`[${Date.now()}] S3 GetObject response:`, imageData);
-
     const imageBody = await streamToBuffer(imageData.Body);
-    console.log(`[${Date.now()}] Image converted to buffer`);
 
-    // Optimize the image using Sharp
+    // Optimize image 
     const optimizedData = await sharp(imageBody)
-      .resize({ width: 1500 }) // Resize to 1500px width
+      .resize({ width: 1200 }) // Resize to 1500px width
       .png({ quality: 80 }) // Compress to 80% quality
       .toBuffer();
-    console.log(`[${Date.now()}] Image optimized with sharp`);
+    console.log("Image optimized with sharp");
 
     // Overwrite the original upload
     const putObjectParams = {
@@ -212,11 +200,11 @@ const optimizeImage = async (bucket, key) => {
       ContentType: 'image/png',
     };
     await s3.send(new PutObjectCommand(putObjectParams));
-    console.log(`[${Date.now()}] Optimized image uploaded back to S3`);
+    console.log("Optimized image uploaded back to S3");
 
     return key;
   } catch (error) {
-    console.error(`[${Date.now()}] Error optimizing image:`, error);
+    console.error("Error optimizing image:", error);
     throw error;
   }
 };
@@ -241,17 +229,21 @@ const createPost = async (query, values) => {
 
 const validatePost = async (postId) => {
   const fetchPostQuery = `
-      SELECT id, type, content, createdat, mediaurls, videourl
-      FROM posts
-      WHERE id = $1
-    `;
+    SELECT id, type, content, createdat, mediaurls, videourl
+    FROM posts
+    WHERE id = $1;
+  `;
   const postResult = await dbClient.query(fetchPostQuery, [postId]);
   const newPost = postResult.rows[0];
+  
   if (!newPost) {
     throw new Error("Failed to retrieve newly created post");
   }
+  newPost.createdat = new Date(newPost.createdat).toISOString();
+
   return newPost;
-}
+};
+
 
 const createResponse = (statusCode, body) => ({
   statusCode,
